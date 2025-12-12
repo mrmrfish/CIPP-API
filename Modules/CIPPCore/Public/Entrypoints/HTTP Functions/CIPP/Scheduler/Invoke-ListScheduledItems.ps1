@@ -19,6 +19,7 @@ function Invoke-ListScheduledItems {
         $ShowHidden = $Request.Query.ShowHidden ?? $Request.Body.ShowHidden
         $Name = $Request.Query.Name ?? $Request.Body.Name
         $Type = $Request.Query.Type ?? $Request.Body.Type
+        $SearchTitle = $Request.query.SearchTitle ?? $Request.body.SearchTitle
 
         if ($ShowHidden -eq $true) {
             $ScheduledItemFilter.Add('Hidden eq true')
@@ -44,6 +45,10 @@ function Invoke-ListScheduledItems {
     $Tasks = Get-CIPPAzDataTableEntity @Table -Filter $Filter
     if ($Type) {
         $Tasks = $Tasks | Where-Object { $_.command -eq $Type }
+    }
+
+    if ($SearchTitle) {
+        $Tasks = $Tasks | Where-Object { $_.Name -like $SearchTitle }
     }
 
     $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
@@ -99,6 +104,17 @@ function Invoke-ListScheduledItems {
                 label = $Task.Tenant
                 value = $Task.Tenant
                 type  = 'Tenant'
+            }
+        }
+        if ($Task.Trigger) {
+            try {
+                $TriggerObject = $Task.Trigger | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($TriggerObject) {
+                    $Task | Add-Member -NotePropertyName Trigger -NotePropertyValue $TriggerObject -Force
+                }
+            } catch {
+                Write-Warning "Failed to parse trigger information for task $($Task.RowKey): $($_.Exception.Message)"
+                # Fall back to keeping original trigger value
             }
         }
 

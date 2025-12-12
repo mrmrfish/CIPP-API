@@ -29,8 +29,14 @@ function Invoke-AddScheduledItem {
             $Result = "Error scheduling task: $($_.Exception.Message)"
         }
     } else {
-        $Result = Add-CIPPScheduledTask -Task $Request.Body -Headers $Request.Headers -hidden $hidden -DisallowDuplicateName $Request.Query.DisallowDuplicateName -DesiredStartTime $Request.Body.DesiredStartTime
-        Write-LogMessage -headers $Request.Headers -API $APINAME -message $Result -Sev 'Info'
+        $ScheduledTask = @{
+            Task                  = $Request.Body
+            Headers               = $Request.Headers
+            hidden                = $hidden
+            DisallowDuplicateName = $Request.Query.DisallowDuplicateName
+            DesiredStartTime      = $Request.Body.DesiredStartTime
+        }
+        $Result = Add-CIPPScheduledTask @ScheduledTask
     }
     return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK

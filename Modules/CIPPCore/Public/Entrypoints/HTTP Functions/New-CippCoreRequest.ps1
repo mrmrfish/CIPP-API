@@ -13,7 +13,22 @@ function New-CippCoreRequest {
     param($Request, $TriggerMetadata)
 
     $FunctionName = 'Invoke-{0}' -f $Request.Params.CIPPEndpoint
-    Write-Information "API: $($Request.Params.CIPPEndpoint)"
+    Write-Information "API Endpoint: $($Request.Params.CIPPEndpoint) | Frontend Version: $($Request.Headers.'X-CIPP-Version' ?? 'Not specified')"
+
+    if ($Request.Headers.'X-CIPP-Version') {
+        $Table = Get-CippTable -tablename 'Version'
+        $FrontendVer = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'Version' and RowKey eq 'frontend'"
+
+        if (!$FrontendVer -or ([semver]$FrontendVer.Version -lt [semver]$Request.Headers.'X-CIPP-Version')) {
+            Add-CIPPAzDataTableEntity @Table -Entity ([pscustomobject]@{
+                    PartitionKey = 'Version'
+                    RowKey       = 'frontend'
+                    Version      = $Request.Headers.'X-CIPP-Version'
+                }) -Force
+        } elseif ([semver]$FrontendVer.Version -gt [semver]$Request.Headers.'X-CIPP-Version') {
+            Write-Warning "Client version $($Request.Headers.'X-CIPP-Version') is older than the current frontend version $($FrontendVer.Version)"
+        }
+    }
 
     $HttpTrigger = @{
         Request         = [pscustomobject]($Request)
@@ -38,6 +53,18 @@ function New-CippCoreRequest {
                     })
             }
 
+            $AllowedTenants = Test-CippAccess -Request $Request -TenantList
+            $AllowedGroups = Test-CippAccess -Request $Request -GroupList
+
+            if ($AllowedTenants -notcontains 'AllTenants') {
+                Write-Warning 'Limiting tenant access'
+                $script:AllowedTenants = $AllowedTenants
+            }
+            if ($AllowedGroups -notcontains 'AllGroups') {
+                Write-Warning 'Limiting group access'
+                $script:AllowedGroups = $AllowedGroups
+            }
+
             try {
                 Write-Information "Access: $Access"
                 Write-LogMessage -headers $Headers -API $Request.Params.CIPPEndpoint -message 'Accessed this API' -Sev 'Debug'
@@ -50,10 +77,17 @@ function New-CippCoreRequest {
                         return ([HttpResponseContext]($HttpResponse | Select-Object -First 1))
                     } else {
                         # If no valid response context found, create a default success response
-                        return ([HttpResponseContext]@{
-                                StatusCode = [HttpStatusCode]::OK
-                                Body       = $Response
-                            })
+                        if ($Response.PSObject.Properties.Name -contains 'StatusCode' -and $Response.PSObject.Properties.Name -contains 'Body') {
+                            return ([HttpResponseContext]@{
+                                    StatusCode = $Response.StatusCode
+                                    Body       = $Response.Body
+                                })
+                        } else {
+                            return ([HttpResponseContext]@{
+                                    StatusCode = [HttpStatusCode]::OK
+                                    Body       = $Response
+                                })
+                        }
                     }
                 }
             } catch {
