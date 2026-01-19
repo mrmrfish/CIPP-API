@@ -19,6 +19,7 @@ function Invoke-CIPPStandardSafeAttachmentPolicy {
             "mdo_safeattachmentpolicy"
             "NIST CSF 2.0 (DE.CM-09)"
         ADDEDCOMPONENT
+            {"type":"textField","name":"standards.SafeAttachmentPolicy.name","label":"Policy Name","required":true,"defaultValue":"CIPP Default Safe Attachment Policy"}
             {"type":"select","multiple":false,"label":"Safe Attachment Action","name":"standards.SafeAttachmentPolicy.SafeAttachmentAction","options":[{"label":"Allow","value":"Allow"},{"label":"Block","value":"Block"},{"label":"DynamicDelivery","value":"DynamicDelivery"}]}
             {"type":"select","multiple":false,"creatable":true,"label":"QuarantineTag","name":"standards.SafeAttachmentPolicy.QuarantineTag","options":[{"label":"AdminOnlyAccessPolicy","value":"AdminOnlyAccessPolicy"},{"label":"DefaultFullAccessPolicy","value":"DefaultFullAccessPolicy"},{"label":"DefaultFullAccessWithNotificationPolicy","value":"DefaultFullAccessWithNotificationPolicy"}]}
             {"type":"switch","label":"Redirect","name":"standards.SafeAttachmentPolicy.Redirect"}
@@ -75,10 +76,9 @@ function Invoke-CIPPStandardSafeAttachmentPolicy {
 
         try {
             $CurrentState = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-SafeAttachmentPolicy' |
-            Where-Object -Property Name -EQ $PolicyName |
-            Select-Object Name, Enable, Action, QuarantineTag, Redirect, RedirectAddress
-        }
-        catch {
+                Where-Object -Property Name -EQ $PolicyName |
+                Select-Object Name, Enable, Action, QuarantineTag, Redirect, RedirectAddress
+        } catch {
             $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
             Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the SafeAttachmentPolicy state for $Tenant. Error: $ErrorMessage" -Sev Error
             return
@@ -94,8 +94,8 @@ function Invoke-CIPPStandardSafeAttachmentPolicy {
         $AcceptedDomains = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-AcceptedDomain'
 
         $RuleState = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-SafeAttachmentRule' |
-        Where-Object -Property Name -EQ $RuleName |
-        Select-Object Name, SafeAttachmentPolicy, Priority, RecipientDomainIs
+            Where-Object -Property Name -EQ $RuleName |
+            Select-Object Name, SafeAttachmentPolicy, Priority, RecipientDomainIs
 
         $RuleStateIsCorrect = ($RuleState.Name -eq $RuleName) -and
         ($RuleState.SafeAttachmentPolicy -eq $PolicyName) -and
@@ -176,12 +176,25 @@ function Invoke-CIPPStandardSafeAttachmentPolicy {
 
         if ($Settings.report -eq $true) {
             Add-CIPPBPAField -FieldName 'SafeAttachmentPolicy' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $tenant
-            if ($StateIsCorrect) {
-                $FieldValue = $true
-            } else {
-                $FieldValue = $CurrentState
+
+            $CurrentValue = @{
+                name            = $CurrentState.Name
+                enable          = $CurrentState.Enable
+                action          = $CurrentState.Action
+                quarantineTag   = $CurrentState.QuarantineTag
+                redirect        = $CurrentState.Redirect
+                redirectAddress = $CurrentState.RedirectAddress
             }
-            Set-CIPPStandardsCompareField -FieldName 'standards.SafeAttachmentPolicy' -FieldValue $FieldValue -Tenant $Tenant
+
+            $ExpectedValue = @{
+                name            = $PolicyName
+                enable          = $true
+                action          = $Settings.SafeAttachmentAction
+                quarantineTag   = $Settings.QuarantineTag
+                redirect        = $Settings.Redirect
+                redirectAddress = $Settings.RedirectAddress
+            }
+            Set-CIPPStandardsCompareField -FieldName 'standards.SafeAttachmentPolicy' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $Tenant
         }
     } else {
         if ($Settings.remediate -eq $true) {
