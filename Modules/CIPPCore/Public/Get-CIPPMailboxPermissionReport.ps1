@@ -39,6 +39,9 @@ function Get-CIPPMailboxPermissionReport {
             $AllMailboxItems = Get-CIPPDbItem -TenantFilter 'allTenants' -Type 'Mailboxes'
             $Tenants = @($AllMailboxItems | Where-Object { $_.RowKey -ne 'Mailboxes-Count' } | Select-Object -ExpandProperty PartitionKey -Unique)
 
+            $TenantList = Get-Tenants -IncludeErrors
+            $Tenants = $Tenants | Where-Object { $TenantList.defaultDomainName -contains $_ }
+
             $AllResults = [System.Collections.Generic.List[PSCustomObject]]::new()
             foreach ($Tenant in $Tenants) {
                 try {
@@ -56,7 +59,7 @@ function Get-CIPPMailboxPermissionReport {
         }
 
         # Get mailboxes from reporting DB
-        $MailboxItems = Get-CIPPDbItem -TenantFilter $TenantFilter -Type 'Mailboxes'
+        $MailboxItems = Get-CIPPDbItem -TenantFilter $TenantFilter -Type 'Mailboxes' | Where-Object { $_.RowKey -ne 'Mailboxes-Count' }
         if (-not $MailboxItems) {
             throw 'No mailbox data found in reporting database. Sync the mailbox permissions first. '
         }

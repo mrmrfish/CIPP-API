@@ -35,7 +35,6 @@ function Invoke-CIPPStandardUserSubmissions {
     $TestResult = Test-CIPPStandardLicense -StandardName 'UserSubmissions' -TenantFilter $Tenant -RequiredCapabilities @('EXCHANGE_S_STANDARD', 'EXCHANGE_S_ENTERPRISE', 'EXCHANGE_S_STANDARD_GOV', 'EXCHANGE_S_ENTERPRISE_GOV', 'EXCHANGE_LITE') #No Foundation because that does not allow powershell access
 
     if ($TestResult -eq $false) {
-        Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
 
@@ -225,9 +224,9 @@ function Invoke-CIPPStandardUserSubmissions {
             ReportJunkToCustomizedAddress    = if ([string]::IsNullOrWhiteSpace($Email)) { $false } else { $true }
             ReportNotJunkToCustomizedAddress = if ([string]::IsNullOrWhiteSpace($Email)) { $false } else { $true }
             ReportPhishToCustomizedAddress   = if ([string]::IsNullOrWhiteSpace($Email)) { $false } else { $true }
-            ReportJunkAddresses              = if ([string]::IsNullOrWhiteSpace($Email)) { $null } else { $Email }
-            ReportNotJunkAddresses           = if ([string]::IsNullOrWhiteSpace($Email)) { $null } else { $Email }
-            ReportPhishAddresses             = if ([string]::IsNullOrWhiteSpace($Email)) { $null } else { $Email }
+            ReportJunkAddresses              = if ([string]::IsNullOrWhiteSpace($Email)) { $null } else { @($Email) }
+            ReportNotJunkAddresses           = if ([string]::IsNullOrWhiteSpace($Email)) { $null } else { @($Email) }
+            ReportPhishAddresses             = if ([string]::IsNullOrWhiteSpace($Email)) { $null } else { @($Email) }
             RuleState                        = if ([string]::IsNullOrWhiteSpace($Email)) {
                 @{
                     State  = 'Disabled'
@@ -236,7 +235,7 @@ function Invoke-CIPPStandardUserSubmissions {
             } else {
                 @{
                     State  = 'Enabled'
-                    SentTo = $Email
+                    SentTo = @($Email)
                 }
             }
         }

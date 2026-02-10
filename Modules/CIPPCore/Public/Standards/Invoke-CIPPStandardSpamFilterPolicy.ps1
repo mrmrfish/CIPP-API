@@ -55,7 +55,6 @@ function Invoke-CIPPStandardSpamFilterPolicy {
     $TestResult = Test-CIPPStandardLicense -StandardName 'SpamFilterPolicy' -TenantFilter $Tenant -RequiredCapabilities @('EXCHANGE_S_STANDARD', 'EXCHANGE_S_ENTERPRISE', 'EXCHANGE_S_STANDARD_GOV', 'EXCHANGE_S_ENTERPRISE_GOV', 'EXCHANGE_LITE') #No Foundation because that does not allow powershell access
 
     if ($TestResult -eq $false) {
-        Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
 
@@ -64,8 +63,7 @@ function Invoke-CIPPStandardSpamFilterPolicy {
 
     try {
         $CurrentState = New-ExoRequest -TenantId $Tenant -cmdlet 'Get-HostedContentFilterPolicy' |
-            Where-Object -Property Name -EQ $PolicyName |
-            Select-Object -Property *
+            Where-Object -Property Name -EQ $PolicyName
     } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the SpamFilterPolicy state for $Tenant. Error: $ErrorMessage" -Sev Error
@@ -136,8 +134,7 @@ function Invoke-CIPPStandardSpamFilterPolicy {
     $AcceptedDomains = New-ExoRequest -TenantId $Tenant -cmdlet 'Get-AcceptedDomain'
 
     $RuleState = New-ExoRequest -TenantId $Tenant -cmdlet 'Get-HostedContentFilterRule' |
-        Where-Object -Property Name -EQ $PolicyName |
-        Select-Object -Property *
+        Where-Object -Property Name -EQ $PolicyName
 
     $RuleStateIsCorrect = ($RuleState.Name -eq $PolicyName) -and
     ($RuleState.HostedContentFilterPolicy -eq $PolicyName) -and
@@ -284,7 +281,7 @@ function Invoke-CIPPStandardSpamFilterPolicy {
             RegionBlockList                  = $CurrentState.RegionBlockList
             AllowedSenderDomains             = $CurrentState.AllowedSenderDomains
         }
-        $ExpectedValue = @{
+        $ExpectedValue = [pscustomobject]@{
             Name                             = $PolicyName
             SpamAction                       = $SpamAction
             SpamQuarantineTag                = $SpamQuarantineTag
@@ -305,10 +302,10 @@ function Invoke-CIPPStandardSpamFilterPolicy {
             MarkAsSpamWebBugsInHtml          = $MarkAsSpamWebBugsInHtml
             MarkAsSpamSensitiveWordList      = $MarkAsSpamSensitiveWordList
             EnableLanguageBlockList          = $Settings.EnableLanguageBlockList
-            LanguageBlockList                = if ($Settings.EnableLanguageBlockList -eq $true) { $Settings.LanguageBlockList.value } else { @() }
+            LanguageBlockList                = $Settings.EnableLanguageBlockList ? @($Settings.EnableLanguageBlockList) : @()
             EnableRegionBlockList            = $Settings.EnableRegionBlockList
-            RegionBlockList                  = if ($Settings.EnableRegionBlockList -eq $true) { $Settings.RegionBlockList.value } else { @() }
-            AllowedSenderDomains             = $Settings.AllowedSenderDomains.value ?? @()
+            RegionBlockList                  = $Settings.RegionBlockList.value ? @($Settings.RegionBlockList.value) : @()
+            AllowedSenderDomains             = $Settings.AllowedSenderDomains.value ? @($Settings.AllowedSenderDomains.value) : @()
         }
         Set-CIPPStandardsCompareField -FieldName 'standards.SpamFilterPolicy' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $Tenant
     }

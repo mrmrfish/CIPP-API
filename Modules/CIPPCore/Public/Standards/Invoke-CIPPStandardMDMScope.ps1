@@ -35,7 +35,6 @@ function Invoke-CIPPStandardMDMScope {
     $TestResult = Test-CIPPStandardLicense -StandardName 'MDMScope' -TenantFilter $Tenant -RequiredCapabilities @('INTUNE_A', 'MDM_Services', 'EMS', 'SCCM', 'MICROSOFTINTUNEPLAN1')
 
     if ($TestResult -eq $false) {
-        Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
 
@@ -144,18 +143,12 @@ function Invoke-CIPPStandardMDMScope {
 
     if ($Settings.report -eq $true) {
         $CurrentValue = @{
-            termsOfUseUrl = $CurrentInfo.termsOfUseUrl
-            discoveryUrl  = $CurrentInfo.discoveryUrl
-            complianceUrl = $CurrentInfo.complianceUrl
-            appliesTo     = $CurrentInfo.appliesTo
-            customGroup   = $CurrentInfo.includedGroups.displayName
+            appliesTo   = $CurrentInfo.appliesTo
+            customGroup = $CurrentInfo.includedGroups.displayName ?? ''
         }
         $ExpectedValue = @{
-            termsOfUseUrl = $Settings.termsOfUseUrl
-            discoveryUrl  = $Settings.discoveryUrl
-            complianceUrl = $Settings.complianceUrl
-            appliesTo     = $Settings.appliesTo
-            customGroup   = $Settings.customGroup
+            appliesTo   = $Settings.appliesTo
+            customGroup = $Settings.customGroup ?? ''
         }
         Set-CIPPStandardsCompareField -FieldName 'standards.MDMScope' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
         Add-CIPPBPAField -FieldName 'MDMScope' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $tenant
