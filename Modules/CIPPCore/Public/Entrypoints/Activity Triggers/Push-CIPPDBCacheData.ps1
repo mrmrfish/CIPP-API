@@ -50,18 +50,13 @@ function Push-CIPPDBCacheData {
             'SecureScore'
             'PIMSettings'
             'Domains'
-            'RoleEligibilitySchedules'
-            'RoleManagementPolicies'
-            'RoleAssignmentScheduleInstances'
             'B2BManagementPolicy'
-            'AuthenticationFlowsPolicy'
             'DeviceRegistrationPolicy'
-            'CredentialUserRegistrationDetails'
-            'UserRegistrationDetails'
             'OAuth2PermissionGrants'
             'AppRoleAssignments'
             'LicenseOverview'
             'MFAState'
+            'BitlockerKeys'
         )
 
         foreach ($CacheFunction in $BasicCacheFunctions) {
@@ -119,24 +114,35 @@ function Push-CIPPDBCacheData {
 
         #region Conditional Access Licensed - Azure AD Premium features
         if ($ConditionalAccessCapable) {
-            $Batch.Add(@{
-                    FunctionName = 'ExecCIPPDBCache'
-                    Name         = 'ConditionalAccessPolicies'
-                    TenantFilter = $TenantFilter
-                    QueueId      = $QueueId
-                })
+            $ConditionalAccessCacheFunctions = @(
+                'ConditionalAccessPolicies'
+                'AuthenticationFlowsPolicy'
+                'CredentialUserRegistrationDetails'
+                'UserRegistrationDetails'
+            )
+            foreach ($CacheFunction in $ConditionalAccessCacheFunctions) {
+                $Batch.Add(@{
+                        FunctionName = 'ExecCIPPDBCache'
+                        Name         = $CacheFunction
+                        TenantFilter = $TenantFilter
+                        QueueId      = $QueueId
+                    })
+            }
         } else {
             Write-Host 'Skipping Conditional Access data collection - tenant does not have required license'
         }
         #endregion Conditional Access Licensed
 
-        #region Azure AD Premium P2 - Identity Protection features
+        #region Azure AD Premium P2 - Identity Protection/PIM features
         if ($AzureADPremiumP2Capable) {
             $P2CacheFunctions = @(
                 'RiskyUsers'
                 'RiskyServicePrincipals'
                 'ServicePrincipalRiskDetections'
                 'RiskDetections'
+                'RoleEligibilitySchedules'
+                'RoleAssignmentSchedules'
+                'RoleManagementPolicies'
             )
             foreach ($CacheFunction in $P2CacheFunctions) {
                 $Batch.Add(@{
@@ -158,6 +164,7 @@ function Push-CIPPDBCacheData {
                 'IntunePolicies'
                 'ManagedDeviceEncryptionStates'
                 'IntuneAppProtectionPolicies'
+                'DetectedApps'
             )
             foreach ($CacheFunction in $IntuneCacheFunctions) {
                 $Batch.Add(@{
