@@ -199,7 +199,7 @@ function Get-GraphRequestList {
             $Type = 'Queue'
             Write-Information "Cached: $(($Rows | Measure-Object).Count) rows (Type: $($Type))"
             $QueueReference = '{0}-{1}' -f $TenantFilter, $PartitionKey
-            $RunningQueue = Get-CIPPQueueData -Reference $QueueReference | Where-Object { $_.Status -ne 'Completed' -and $_.Status -ne 'Failed' }
+            $RunningQueue = Get-CIPPQueueData -Reference $QueueReference | Where-Object { $_.Status -ne 'Completed' -and $_.Status -ne 'Failed' -and $_.Reference -eq $QueueReference }
         } elseif (!$SkipCache.IsPresent -and !$ClearCache.IsPresent -and !$CountOnly.IsPresent) {
             if ($TenantFilter -eq 'AllTenants' -or $Count -gt $SingleTenantThreshold) {
                 $Table = Get-CIPPTable -TableName $TableName
@@ -214,7 +214,7 @@ function Get-GraphRequestList {
                 $Type = 'Cache'
                 Write-Information "Table: $TableName | PK: $PartitionKey | Cached: $(($Rows | Measure-Object).Count) rows (Type: $($Type))"
                 $QueueReference = '{0}-{1}' -f $TenantFilter, $PartitionKey
-                $RunningQueue = Get-CIPPQueueData -Reference $QueueReference | Where-Object { $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' }
+                $RunningQueue = Get-CIPPQueueData -Reference $QueueReference | Where-Object { $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' -and $_.Reference -eq $QueueReference }
             }
         }
     } catch {
@@ -294,6 +294,7 @@ function Get-GraphRequestList {
                             $InputObject = @{
                                 OrchestratorName = 'GraphRequestOrchestrator'
                                 Batch            = @($Batch)
+                                Reference        = $QueueReference
                             }
                             #Write-Information  ($InputObject | ConvertTo-Json -Depth 5)
                             $InstanceId = Start-CIPPOrchestrator -InputObject $InputObject
@@ -351,7 +352,17 @@ function Get-GraphRequestList {
 
                     if (!$QueueThresholdExceeded) {
                         #nextLink should ONLY be used in direct calls with manual pagination. It should not be used in queueing
-                        if ($ManualPagination.IsPresent -and $nextLink -match '^https://.+') { $GraphRequest.uri = $nextLink }
+                        if ($ManualPagination.IsPresent -and $nextLink -match '^https://.+') {
+                            try {
+                                $ParsedNextLink = [System.Uri]$nextLink
+                                if ($ParsedNextLink.Host -ne 'graph.microsoft.com') {
+                                    throw "Invalid nextLink host: $($ParsedNextLink.Host)"
+                                }
+                            } catch {
+                                throw "Invalid nextLink URL: $nextLink"
+                            }
+                            $GraphRequest.uri = $nextLink
+                        }
 
                         $GraphRequestResults = New-GraphGetRequest @GraphRequest -Caller $Caller -ErrorAction Stop
                         $GraphRequestResults = $GraphRequestResults | Select-Object *, @{n = 'Tenant'; e = { $TenantFilter } }, @{n = 'CippStatus'; e = { 'Good' } }

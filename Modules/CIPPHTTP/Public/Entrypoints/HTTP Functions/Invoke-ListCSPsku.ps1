@@ -4,6 +4,8 @@ function Invoke-ListCSPsku {
         Entrypoint
     .ROLE
         Tenant.Directory.Read
+    .DESCRIPTION
+        Lists available CSP SKUs and current subscriptions for a tenant via the Sherweb integration.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -19,11 +21,16 @@ function Invoke-ListCSPsku {
         }
         $StatusCode = [HttpStatusCode]::OK
     } catch {
-        $GraphRequest = [PSCustomObject]@{
-            name = @(@{value = 'Error getting catalog' })
-            sku  = $_.Exception.Message
+        if ($_.Exception.Message -eq 'No Sherweb mapping found') {
+            $GraphRequest = @()
+            $StatusCode = [HttpStatusCode]::OK
+        } else {
+            $GraphRequest = [PSCustomObject]@{
+                name = @(@{value = 'Error getting catalog' })
+                sku  = $_.Exception.Message
+            }
+            $StatusCode = [HttpStatusCode]::InternalServerError
         }
-        $StatusCode = [HttpStatusCode]::InternalServerError
     }
 
     return [HttpResponseContext]@{

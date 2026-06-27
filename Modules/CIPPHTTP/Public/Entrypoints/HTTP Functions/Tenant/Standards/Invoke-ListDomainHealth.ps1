@@ -4,6 +4,8 @@ function Invoke-ListDomainHealth {
         Entrypoint,AnyTenant
     .ROLE
         Tenant.DomainAnalyser.Read
+    .DESCRIPTION
+        Performs real-time DNS health checks (MX, SPF, DMARC, DKIM, DNSSEC, MTA-STS, HTTPS) for a specific domain.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -132,6 +134,15 @@ function Invoke-ListDomainHealth {
                             Domain = $Request.Query.Domain
                         }
                         $Body = Test-MtaSts @HttpsQuery
+                    }
+                    'ReadAutoDiscover' {
+                        $AutoDiscoverQuery = @{
+                            Domain = $Request.Query.Domain
+                        }
+                        if ($Request.Query.ExpectedTarget) {
+                            $AutoDiscoverQuery.ExpectedTarget = $Request.Query.ExpectedTarget
+                        }
+                        $Body = Read-AutoDiscoverRecord @AutoDiscoverQuery
                     }
                 }
             } else {

@@ -8,7 +8,12 @@ function Invoke-ExecListAppId {
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
     Get-CIPPAuthentication
-    $ResponseURL = "$(($Request.headers.'x-ms-original-url').replace('/api/ExecListAppId','/api/ExecSAMSetup'))"
+    $ResponseURL = if ($Request.headers.'x-ms-original-url') {
+        "$(($Request.headers.'x-ms-original-url').replace('/api/ExecListAppId','/api/ExecSAMSetup'))"
+    } else {
+        $origin = $Request.headers.origin ?? $Request.headers.referer?.TrimEnd('/')
+        "$origin/api/ExecSAMSetup"
+    }
     #make sure we get the very latest version of the appid from kv:
     if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true' -or $env:NonLocalHostAzurite -eq 'true') {
         $DevSecretsTable = Get-CIPPTable -tablename 'DevSecrets'
@@ -67,20 +72,26 @@ function Invoke-ExecListAppId {
         if ($AppResponse.body) {
             $AppWeb = $AppResponse.body.web
             if ($AppWeb.redirectUris) {
-                # construct new redirect uri with current
-                $URL = ($Request.headers.'x-ms-original-url').split('/api') | Select-Object -First 1
+                # construct new redirect uri with current origin
+                $URL = if ($Request.headers.'x-ms-original-url') {
+                    ($Request.headers.'x-ms-original-url').split('/api') | Select-Object -First 1
+                } else {
+                    $Request.headers.origin ?? $Request.headers.referer?.TrimEnd('/')
+                }
                 $NewRedirectUri = "$($URL)/authredirect"
-                if ($AppWeb.redirectUris -notcontains $NewRedirectUri) {
+                $NewAuthCallbackUri = "$($URL)/.auth/callback"
+                $MissingUris = @($NewRedirectUri, $NewAuthCallbackUri) | Where-Object { $AppWeb.redirectUris -notcontains $_ }
+                if ($MissingUris.Count -gt 0) {
                     try {
                         $RedirectUris = [system.collections.generic.list[string]]::new()
                         $AppWeb.redirectUris | ForEach-Object { $RedirectUris.Add($_) }
-                        $RedirectUris.Add($NewRedirectUri)
+                        $MissingUris | ForEach-Object { $RedirectUris.Add($_) }
                         $AppUpdateBody = @{
                             web = @{
                                 redirectUris = $RedirectUris
                             }
                         } | ConvertTo-Json -Depth 10
-                        Invoke-GraphRequest -Method PATCH -Url "https://graph.microsoft.com/v1.0/applications/$($AppResponse.body.id)" -Body $AppUpdateBody -tenantid $env:TenantID -NoAuthCheck $true
+                        $null = New-GraphPOSTRequest -type PATCH -Uri "https://graph.microsoft.com/v1.0/applications/$($AppResponse.body.id)" -Body $AppUpdateBody -tenantid $env:TenantID -NoAuthCheck $true
                         Write-LogMessage -message "Updated redirect URIs for application $($env:ApplicationID) to include $NewRedirectUri" -Sev 'Info'
                     } catch {
                         Write-LogMessage -message "Failed to update redirect URIs for application $($env:ApplicationID)" -LogData (Get-CippException -Exception $_) -sev 'Warning'

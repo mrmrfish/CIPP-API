@@ -69,7 +69,27 @@ function Get-CIPPTenantAlignment {
             $Tenants = Get-Tenants -IncludeErrors
             $AllStandards | Where-Object { $_.PartitionKey -in $Tenants.defaultDomainName }
         }
-        $TagTemplates = Get-CIPPAzDataTableEntity @TemplateTable
+        $TagTemplates = Get-CIPPAzDataTableEntity @TemplateTable -Filter "PartitionKey eq 'IntuneTemplate'"
+        # Build a hashtable indexed by Package for O(1) tag lookup
+        $TemplatesByPackage = @{}
+        foreach ($t in $TagTemplates) {
+            if ($t.Package) {
+                if (-not $TemplatesByPackage.ContainsKey($t.Package)) {
+                    $TemplatesByPackage[$t.Package] = [System.Collections.Generic.List[object]]::new()
+                }
+                $TemplatesByPackage[$t.Package].Add($t)
+            }
+        }
+        $CATagTemplates = Get-CIPPAzDataTableEntity @TemplateTable -Filter "PartitionKey eq 'CATemplate'"
+        $CATemplatesByPackage = @{}
+        foreach ($t in $CATagTemplates) {
+            if ($t.Package) {
+                if (-not $CATemplatesByPackage.ContainsKey($t.Package)) {
+                    $CATemplatesByPackage[$t.Package] = [System.Collections.Generic.List[object]]::new()
+                }
+                $CATemplatesByPackage[$t.Package].Add($t)
+            }
+        }
         # Build tenant standards data structure
         $tenantData = @{}
         foreach ($Standard in $Standards) {
@@ -88,7 +108,8 @@ function Get-CIPPTenantAlignment {
                 }
             }
 
-            if ($Tenant -and -not $tenantData.ContainsKey($Tenant)) {
+            if (-not $Tenant) { continue }
+            if (-not $tenantData.ContainsKey($Tenant)) {
                 $tenantData[$Tenant] = @{}
             }
             $tenantData[$Tenant][$FieldName] = @{
@@ -202,10 +223,10 @@ function Get-CIPPTenantAlignment {
 
                         if ($IntuneTemplate.'TemplateList-Tags') {
                             foreach ($Tag in $IntuneTemplate.'TemplateList-Tags') {
-                                Write-Host "Processing Intune Tag: $($Tag.value)"
                                 $IntuneActions = if ($IntuneTemplate.action) { $IntuneTemplate.action } else { @() }
                                 $IntuneReportingEnabled = ($IntuneActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
-                                $TagTemplate = $TagTemplates | Where-Object -Property package -EQ $Tag.value
+                                $TagValue = if ($Tag.value) { $Tag.value } else { $Tag }
+                                $TagTemplate = if ($TagValue -and $TemplatesByPackage.ContainsKey($TagValue)) { $TemplatesByPackage[$TagValue] } else { @() }
                                 $TagTemplate | ForEach-Object {
                                     $TagStandardId = "standards.IntuneTemplate.$($_.GUID)"
                                     [PSCustomObject]@{
@@ -228,6 +249,23 @@ function Get-CIPPTenantAlignment {
                             [PSCustomObject]@{
                                 StandardId       = $CAStandardId
                                 ReportingEnabled = $CAReportingEnabled
+                            }
+                        }
+
+                        if ($CATemplate.'TemplateList-Tags') {
+                            foreach ($Tag in $CATemplate.'TemplateList-Tags') {
+                                Write-Host "Processing CA Tag: $($Tag.value)"
+                                $CAActions = if ($CATemplate.action) { $CATemplate.action } else { @() }
+                                $CAReportingEnabled = ($CAActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
+                                $TagValue = if ($Tag.value) { $Tag.value } else { $Tag }
+                                $TagTemplate = if ($CATemplatesByPackage.ContainsKey($TagValue)) { $CATemplatesByPackage[$TagValue] } else { @() }
+                                $TagTemplate | ForEach-Object {
+                                    $TagStandardId = "standards.ConditionalAccessTemplate.$($_.GUID)"
+                                    [PSCustomObject]@{
+                                        StandardId       = $TagStandardId
+                                        ReportingEnabled = $CAReportingEnabled
+                                    }
+                                }
                             }
                         }
                     }
@@ -253,8 +291,10 @@ function Get-CIPPTenantAlignment {
                 }
             }
 
-            $AllStandards = $StandardsData.StandardId
-            $AllStandardsArray = @($AllStandards)
+            if (-not $StandardsData) { continue }
+            $AllStandards = @($StandardsData.StandardId | Where-Object { $_ })
+            if ($AllStandards.Count -eq 0) { continue }
+            $AllStandardsArray = $AllStandards
             $ReportingDisabledStandards = ($StandardsData | Where-Object { -not $_.ReportingEnabled }).StandardId
             $ReportingDisabledSet = [System.Collections.Generic.HashSet[string]]::new()
             foreach ($item in $ReportingDisabledStandards) { [void]$ReportingDisabledSet.Add($item) }
@@ -378,6 +418,14 @@ function Get-CIPPTenantAlignment {
                 $LicenseMissingStandards = 0
                 $ReportingDisabledStandardsCount = 0
 
+                # Initialize deviation counts before ComparisonResults loop so standards can be counted too
+                $PendingDeviationsCount = $null
+                $DeniedDeviationsCount = $null
+                if ($IsDriftTemplate) {
+                    $PendingDeviationsCount = 0
+                    $DeniedDeviationsCount = 0
+                }
+
                 foreach ($item in $ComparisonResults) {
                     $IsAcceptedDeviation = $false
                     $DeviationStatus = $null
@@ -395,30 +443,43 @@ function Get-CIPPTenantAlignment {
                     }
 
                     if ($item.ComplianceStatus -in @('Compliant', 'Accepted Deviation', 'Customer Specific')) { $CompliantStandards++ }
-                    elseif ($item.ComplianceStatus -eq 'Non-Compliant') { $NonCompliantStandards++ }
-                    elseif ($item.ComplianceStatus -eq 'License Missing') { $LicenseMissingStandards++ }
+                    elseif ($item.ComplianceStatus -eq 'Non-Compliant') {
+                        $NonCompliantStandards++
+                        # Count non-compliant standards as pending/denied based on drift status
+                        if ($IsDriftTemplate) {
+                            if (-not $DeviationStatus -or $DeviationStatus -eq 'New') {
+                                $PendingDeviationsCount++
+                            } elseif ($DeviationStatus -in @('Denied', 'DeniedRemediate', 'DeniedDelete')) {
+                                $DeniedDeviationsCount++
+                            }
+                        }
+                    } elseif ($item.ComplianceStatus -eq 'License Missing') { $LicenseMissingStandards++ }
                     if ($item.ReportingDisabled) { $ReportingDisabledStandardsCount++ }
                 }
 
                 # For drift templates, include all policy deviation entries from tenantDrift table in alignment score
                 # Accepted/CustomerSpecific count as compliant, all others (New, Denied, etc.) count as non-compliant
-                $CurrentDeviationsCount = $null
                 if ($IsDriftTemplate) {
                     $PolicyDeviationCompliant = 0
                     $PolicyDeviationNonCompliant = 0
                     foreach ($DriftKey in $TenantDriftStatuses.Keys) {
                         if ($DriftKey -like 'IntuneTemplates.*' -or $DriftKey -like 'ConditionalAccessTemplates.*') {
-                            if ($TenantDriftStatuses[$DriftKey] -in @('Accepted', 'CustomerSpecific')) {
+                            $DriftStatus = $TenantDriftStatuses[$DriftKey]
+                            if ($DriftStatus -in @('Accepted', 'CustomerSpecific')) {
                                 $PolicyDeviationCompliant++
                             } else {
                                 $PolicyDeviationNonCompliant++
+                                if ($DriftStatus -eq 'New') {
+                                    $PendingDeviationsCount++
+                                } else {
+                                    $DeniedDeviationsCount++
+                                }
                             }
                         }
                     }
                     $AllCount += $PolicyDeviationCompliant + $PolicyDeviationNonCompliant
                     $CompliantStandards += $PolicyDeviationCompliant
                     $NonCompliantStandards += $PolicyDeviationNonCompliant
-                    $CurrentDeviationsCount = $PolicyDeviationNonCompliant
                 }
 
                 $AlignmentPercentage = if (($AllCount - $ReportingDisabledStandardsCount) -gt 0) {
@@ -450,7 +511,8 @@ function Get-CIPPTenantAlignment {
                     LicenseMissingStandards  = $LicenseMissingStandards
                     TotalStandards           = $AllCount
                     ReportingDisabledCount   = $ReportingDisabledStandardsCount
-                    CurrentDeviationsCount   = $CurrentDeviationsCount
+                    PendingDeviationsCount   = $PendingDeviationsCount
+                    DeniedDeviationsCount    = $DeniedDeviationsCount
                     LatestDataCollection     = if ($LatestDataCollection) { $LatestDataCollection } else { $null }
                     ComparisonDetails        = $ComparisonResults
                 }
