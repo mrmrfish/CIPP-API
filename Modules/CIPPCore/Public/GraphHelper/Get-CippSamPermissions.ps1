@@ -12,9 +12,11 @@ function Get-CippSamPermissions {
     The effective set returned in .Permissions is therefore always manifest ∪ extras. Each permission
     is annotated with a 'required' boolean so the UI can lock the manifest-defined defaults.
 
-    Unless -NoDiff is used, the function also pulls the live CIPP-SAM application registration from the
-    partner tenant and diffs its requiredResourceAccess against the effective set, surfacing
-    permissions that need to be added to (MissingPermissions) and removed from (PartnerAppDiff) the app.
+    Unless -NoDiff is used, the function also reads what is actually granted on the CIPP-SAM enterprise
+    application (service principal) in the partner tenant - appRoleAssignments (application/Role) and
+    oauth2PermissionGrants (delegated/Scope) - and diffs those grants against the effective set,
+    surfacing permissions that need to be granted (MissingPermissions) and grants that are present but
+    not in the effective set (PartnerAppDiff). The app registration's requiredResourceAccess is not used.
 
     .EXAMPLE
     Get-CippSamPermissions
@@ -195,58 +197,44 @@ function Get-CippSamPermissions {
         }
     }
 
-    # Diff the effective set against the live CIPP-SAM application registration in the partner tenant.
-    # MissingPermissions = effective perms not yet on the app (need to be added).
-    # PartnerAppDiff also surfaces extra perms on the app that are not in the effective set (need to be removed).
+    # Diff the manifest-required base against the saved AppPermissions table. The table records what has
+    # been applied to the CIPP-SAM app - the repair/update flow persists it as manifest ∪ extras - so it
+    # stands in for the "current" permission set and no partner-tenant Graph call is needed here.
+    # MissingPermissions = manifest-required perms not yet present in the table (a Permissions repair is needed).
+    # PartnerAppDiff mirrors MissingPermissions in the shape the SAM permissions page expects.
     $MissingPermissions = @{}
     $PartnerAppDiff = @{}
     if (!$NoDiff.IsPresent) {
-        try {
-            $PartnerApp = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/applications(appId='$($env:ApplicationID)')?`$select=requiredResourceAccess" -tenantid $env:TenantID -NoAuthCheck $true
-            foreach ($AppId in $AllAppIds) {
-                $ServicePrincipal = $ServicePrincipals | Where-Object -Property appId -EQ $AppId
-                $AppRegResource = $PartnerApp.requiredResourceAccess | Where-Object -Property resourceAppId -EQ $AppId
-                $AppRegRoleIds = @(($AppRegResource.resourceAccess | Where-Object { $_.type -eq 'Role' }).id)
-                $AppRegScopeIds = @(($AppRegResource.resourceAccess | Where-Object { $_.type -eq 'Scope' }).id)
+        foreach ($AppId in $AllAppIds) {
+            $ManifestApp = $ManifestPermissions.$AppId
+            $SavedApp = $SavedPermissions.$AppId
 
-                # Only GUID-based permissions live in the app registration's requiredResourceAccess.
-                # String-named scopes (e.g. the .Sdp AdditionalPermissions) are applied as direct grants,
-                # so excluding them here avoids permanent false-positive "missing" entries.
-                $EffApp = @($EffectivePermissions.$AppId.applicationPermissions | Where-Object { $_.id -match $GuidRegex })
-                $EffDel = @($EffectivePermissions.$AppId.delegatedPermissions | Where-Object { $_.id -match $GuidRegex })
-                $EffAppIds = @($EffApp.id)
-                $EffDelIds = @($EffDel.id)
+            $SavedAppIds = @($SavedApp.applicationPermissions.id)
+            $SavedDelIds = @($SavedApp.delegatedPermissions.id)
 
-                $MissingApp = @(foreach ($Permission in $EffApp) { if ($AppRegRoleIds -notcontains $Permission.id) { $Permission } })
-                $MissingDel = @(foreach ($Permission in $EffDel) { if ($AppRegScopeIds -notcontains $Permission.id) { $Permission } })
-                $ExtraApp = @(foreach ($Id in $AppRegRoleIds) {
-                        if ($EffAppIds -notcontains $Id) {
-                            [PSCustomObject]@{ id = $Id; value = (($ServicePrincipal.appRoles | Where-Object -Property id -EQ $Id).value) ?? $Id }
-                        }
-                    })
-                $ExtraDel = @(foreach ($Id in $AppRegScopeIds) {
-                        if ($EffDelIds -notcontains $Id) {
-                            [PSCustomObject]@{ id = $Id; value = (($ServicePrincipal.publishedPermissionScopes | Where-Object -Property id -EQ $Id).value) ?? $Id }
-                        }
-                    })
-
-                if ($MissingApp.Count -gt 0 -or $MissingDel.Count -gt 0) {
-                    $MissingPermissions.$AppId = @{
-                        applicationPermissions = $MissingApp
-                        delegatedPermissions   = $MissingDel
+            $MissingApp = @(foreach ($Permission in $ManifestApp.applicationPermissions) {
+                    if ($Permission.id -and $SavedAppIds -notcontains $Permission.id) {
+                        [PSCustomObject]@{ id = $Permission.id; value = $Permission.value }
                     }
+                })
+            $MissingDel = @(foreach ($Permission in $ManifestApp.delegatedPermissions) {
+                    if ($Permission.id -and $SavedDelIds -notcontains $Permission.id) {
+                        [PSCustomObject]@{ id = $Permission.id; value = $Permission.value }
+                    }
+                })
+
+            if ($MissingApp.Count -gt 0 -or $MissingDel.Count -gt 0) {
+                $MissingPermissions.$AppId = @{
+                    applicationPermissions = $MissingApp
+                    delegatedPermissions   = $MissingDel
                 }
-                if ($MissingApp.Count -gt 0 -or $MissingDel.Count -gt 0 -or $ExtraApp.Count -gt 0 -or $ExtraDel.Count -gt 0) {
-                    $PartnerAppDiff.$AppId = @{
-                        missingApplicationPermissions = $MissingApp
-                        missingDelegatedPermissions   = $MissingDel
-                        extraApplicationPermissions   = $ExtraApp
-                        extraDelegatedPermissions     = $ExtraDel
-                    }
+                $PartnerAppDiff.$AppId = @{
+                    missingApplicationPermissions = $MissingApp
+                    missingDelegatedPermissions   = $MissingDel
+                    extraApplicationPermissions   = @()
+                    extraDelegatedPermissions     = @()
                 }
             }
-        } catch {
-            Write-Information "Failed to retrieve partner app registration for permission diff: $($_.Exception.Message)"
         }
     }
 

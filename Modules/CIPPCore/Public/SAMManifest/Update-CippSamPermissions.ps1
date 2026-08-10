@@ -1,15 +1,18 @@
 function Update-CippSamPermissions {
     <#
     .SYNOPSIS
-        Repairs the CIPP-SAM app registration permissions in the partner tenant.
+        Reconciles the applied CIPP-SAM permission set in the AppPermissions table.
     .DESCRIPTION
-        Diffs the effective CIPP-SAM permission set (manifest defaults + saved extras) against the live
-        CIPP-SAM application registration in the partner tenant and ADDS any missing permissions to the
-        app registration's requiredResourceAccess. This is additive only: it never removes permissions,
-        so it cannot strip a legitimately-configured entry. Extra permissions found on the app that are
-        not part of the effective set are reported back so an admin can review/remove them manually.
+        Writes the full applied permission set - the SAM manifest base PLUS any admin-configured extra
+        permissions - into the AppPermissions table, so the table always reflects everything the
+        CIPP-SAM app is expected to have. Get-CippSamPermissions diffs the manifest against this table
+        to decide when a Permissions repair is needed, so persisting the manifest here is what lets that
+        check clear after a repair.
 
-        Pushing these permissions out to customer tenants is handled separately by the CPV refresh.
+        It deliberately does NOT write the partner CIPP-SAM app registration's requiredResourceAccess.
+        Permissions reach the CIPP-SAM service principal(s) - partner and clients - through the grant
+        flow (Add-CIPPApplicationPermission / Add-CIPPDelegatedPermission, which read this table), not
+        through the app registration.
     .PARAMETER UpdatedBy
         The user or system that is performing the update. Defaults to 'CIPP-API'.
     .OUTPUTS
@@ -22,87 +25,69 @@ function Update-CippSamPermissions {
     )
 
     try {
-        $CurrentPermissions = Get-CippSamPermissions
-        $PartnerAppDiff = $CurrentPermissions.PartnerAppDiff
-        $MissingPermissions = $CurrentPermissions.MissingPermissions
+        # Manifest base - the always-required permissions.
+        $ManifestPermissions = (Get-CippSamPermissions -ManifestOnly).Permissions
 
-        $MissingAppIds = @($MissingPermissions.PSObject.Properties.Name)
-        $ExtraAppIds = @($PartnerAppDiff.PSObject.Properties.Name | Where-Object {
-                ($PartnerAppDiff.$_.extraApplicationPermissions | Measure-Object).Count -gt 0 -or
-                ($PartnerAppDiff.$_.extraDelegatedPermissions | Measure-Object).Count -gt 0
-            })
-
-        if ($MissingAppIds.Count -eq 0) {
-            if ($ExtraAppIds.Count -gt 0) {
-                $ExtraSummary = foreach ($AppId in $ExtraAppIds) {
-                    $Names = @($PartnerAppDiff.$AppId.extraApplicationPermissions.value) + @($PartnerAppDiff.$AppId.extraDelegatedPermissions.value)
-                    "$AppId ($($Names -join ', '))"
-                }
-                return "No missing permissions to add. The following extra permissions are present on the app and should be reviewed/removed manually: $($ExtraSummary -join '; ')"
+        $Table = Get-CIPPTable -TableName 'AppPermissions'
+        $SavedRow = Get-CippAzDataTableEntity @Table -Filter "PartitionKey eq 'CIPP-SAM' and RowKey eq 'CIPP-SAM'"
+        $Saved = $null
+        if ($SavedRow.Permissions) {
+            try {
+                $Saved = $SavedRow.Permissions | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                $Saved = $null
             }
-            return 'No permissions to update'
         }
 
-        # Retrieve the live CIPP-SAM application registration in the partner tenant.
-        $PartnerApp = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/applications(appId='$($env:ApplicationID)')?`$select=id,requiredResourceAccess" -tenantid $env:TenantID -NoAuthCheck $true
+        # Build the full applied set = manifest base ∪ admin extras, keyed by resource appId.
+        $Applied = @{}
+        $AppIds = @(@($ManifestPermissions.PSObject.Properties.Name) + @($Saved.PSObject.Properties.Name)) | Where-Object { $_ } | Sort-Object -Unique
+        foreach ($AppId in $AppIds) {
+            $ManifestApp = $ManifestPermissions.$AppId
+            $SavedApp = $Saved.$AppId
+            $ManifestAppIds = @($ManifestApp.applicationPermissions.id)
+            $ManifestDelIds = @($ManifestApp.delegatedPermissions.id)
 
-        $RequiredResourceAccess = [System.Collections.Generic.List[object]]::new()
-        foreach ($Resource in $PartnerApp.requiredResourceAccess) {
-            $ResourceAccess = [System.Collections.Generic.List[object]]::new()
-            foreach ($Access in $Resource.resourceAccess) {
-                $ResourceAccess.Add(@{ id = $Access.id; type = $Access.type })
+            $AppPerms = [System.Collections.Generic.List[object]]::new()
+            $DelPerms = [System.Collections.Generic.List[object]]::new()
+
+            # Manifest base (always applied).
+            foreach ($Permission in $ManifestApp.applicationPermissions) {
+                $AppPerms.Add([PSCustomObject]@{ id = $Permission.id; value = $Permission.value })
             }
-            $RequiredResourceAccess.Add([PSCustomObject]@{
-                    resourceAppId  = $Resource.resourceAppId
-                    resourceAccess = $ResourceAccess
-                })
-        }
-
-        $AddedPermissions = [System.Collections.Generic.List[string]]::new()
-        foreach ($AppId in $MissingAppIds) {
-            $Resource = $RequiredResourceAccess | Where-Object -Property resourceAppId -EQ $AppId | Select-Object -First 1
-            if (!$Resource) {
-                $Resource = [PSCustomObject]@{
-                    resourceAppId  = $AppId
-                    resourceAccess = [System.Collections.Generic.List[object]]::new()
-                }
-                $RequiredResourceAccess.Add($Resource)
+            foreach ($Permission in $ManifestApp.delegatedPermissions) {
+                $DelPerms.Add([PSCustomObject]@{ id = $Permission.id; value = $Permission.value })
             }
-            $ExistingIds = @($Resource.resourceAccess.id)
-
-            foreach ($Permission in $MissingPermissions.$AppId.applicationPermissions) {
-                if ($Permission.id -and $ExistingIds -notcontains $Permission.id) {
-                    $Resource.resourceAccess.Add(@{ id = $Permission.id; type = 'Role' })
-                    $AddedPermissions.Add("$($Permission.value) (Application)")
+            # Admin extras (anything the manifest does not already cover).
+            foreach ($Permission in $SavedApp.applicationPermissions) {
+                if ($Permission.id -and $ManifestAppIds -notcontains $Permission.id) {
+                    $AppPerms.Add([PSCustomObject]@{ id = $Permission.id; value = $Permission.value })
                 }
             }
-            foreach ($Permission in $MissingPermissions.$AppId.delegatedPermissions) {
-                if ($Permission.id -and $ExistingIds -notcontains $Permission.id) {
-                    $Resource.resourceAccess.Add(@{ id = $Permission.id; type = 'Scope' })
-                    $AddedPermissions.Add("$($Permission.value) (Delegated)")
+            foreach ($Permission in $SavedApp.delegatedPermissions) {
+                if ($Permission.id -and $ManifestDelIds -notcontains $Permission.id) {
+                    $DelPerms.Add([PSCustomObject]@{ id = $Permission.id; value = $Permission.value })
+                }
+            }
+
+            if ($AppPerms.Count -gt 0 -or $DelPerms.Count -gt 0) {
+                $Applied.$AppId = @{
+                    applicationPermissions = @($AppPerms)
+                    delegatedPermissions   = @($DelPerms)
                 }
             }
         }
 
-        if ($AddedPermissions.Count -eq 0) {
-            return 'No permissions to update'
+        $Entity = @{
+            'PartitionKey' = 'CIPP-SAM'
+            'RowKey'       = 'CIPP-SAM'
+            'Permissions'  = [string]([PSCustomObject]$Applied | ConvertTo-Json -Depth 10 -Compress)
+            'UpdatedBy'    = $UpdatedBy
         }
+        $null = Add-CIPPAzDataTableEntity @Table -Entity $Entity -Force
 
-        $PatchBody = @{ requiredResourceAccess = @($RequiredResourceAccess) } | ConvertTo-Json -Depth 10 -Compress
-        $null = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/applications/$($PartnerApp.id)" -tenantid $env:TenantID -body $PatchBody -type PATCH -NoAuthCheck $true
-
-        Write-LogMessage -API 'UpdateCippSamPermissions' -message "CIPP-SAM app registration permissions repaired by $UpdatedBy" -Sev 'Info' -LogData @{ Added = $AddedPermissions }
-
-        $Result = "Added $($AddedPermissions.Count) missing permission(s) to the CIPP-SAM app registration: $($AddedPermissions -join ', '). Run a CPV refresh to apply these to customer tenants."
-        if ($ExtraAppIds.Count -gt 0) {
-            $ExtraSummary = foreach ($AppId in $ExtraAppIds) {
-                $Names = @($PartnerAppDiff.$AppId.extraApplicationPermissions.value) + @($PartnerAppDiff.$AppId.extraDelegatedPermissions.value)
-                "$AppId ($($Names -join ', '))"
-            }
-            $Result += " Extra permissions present on the app that should be reviewed/removed manually: $($ExtraSummary -join '; ')."
-        }
-        return $Result
+        return 'CIPP-SAM permissions reconciled: the applied permission table now contains the CIPP manifest permissions plus any additional permissions.'
     } catch {
-        throw "Failed to update permissions: $($_.Exception.Message)"
+        throw "Failed to reconcile permissions: $($_.Exception.Message)"
     }
 }

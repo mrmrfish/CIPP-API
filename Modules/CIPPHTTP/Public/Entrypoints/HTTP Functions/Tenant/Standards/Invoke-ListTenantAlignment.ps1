@@ -11,7 +11,7 @@ function Invoke-ListTenantAlignment {
     param($Request, $TriggerMetadata)
 
     $APIName = $Request.Params.CIPPEndpoint
-    $Granular = $Request.Query.granular -eq 'true'
+    $Granular = $Request.Query.granular -eq $true
     try {
         # Use the new Get-CIPPTenantAlignment function to get alignment data
         $AlignmentData = Get-CIPPTenantAlignment
@@ -20,7 +20,7 @@ function Invoke-ListTenantAlignment {
         $TemplateLookup = @{}
         if ($Granular) {
             $TemplateTable = Get-CippTable -tablename 'templates'
-            $TemplatePartitions = @('IntuneTemplate', 'ConditionalAccessTemplate', 'QuarantineTemplate')
+            $TemplatePartitions = @('IntuneTemplate', 'ConditionalAccessTemplate', 'QuarantineTemplate', 'IntuneReusableSettingTemplate')
             foreach ($Partition in $TemplatePartitions) {
                 Get-CIPPAzDataTableEntity @TemplateTable -Filter "PartitionKey eq '$Partition'" | ForEach-Object {
                     $TemplateRow = $_
@@ -64,6 +64,7 @@ function Invoke-ListTenantAlignment {
                                 'IntuneTemplate' { 'Intune Template' }
                                 'ConditionalAccessTemplate' { 'Conditional Access Template' }
                                 'QuarantineTemplate' { 'Quarantine Template' }
+                                'ReusableSettingsTemplate' { 'Reusable Settings Template' }
                                 default { $MatchType }
                             }
                             "$FriendlyType - $PolicyName"
