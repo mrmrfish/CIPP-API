@@ -56,6 +56,17 @@ function Invoke-CIPPStandardConditionalAccessTemplate {
 
     $Table = Get-CippTable -tablename 'templates'
 
+    # The template picker surfaces the row's GUID column, while everything here resolves by RowKey.
+    # CIPP writes both to the same value, so match either rather than reporting a template that is
+    # sitting in the table as missing.
+    $TemplateKey = ConvertTo-CIPPODataFilterValue -Value $Settings.TemplateList.value -Type String
+    $TemplateRow = Get-CippAzDataTableEntity @Table -Filter "PartitionKey eq 'CATemplate' and (RowKey eq '$TemplateKey' or GUID eq '$TemplateKey')" | Select-Object -First 1
+    $JSONObj = $TemplateRow.JSON
+    # Resolve custom variables for the report path too, not just the deploy inside
+    # New-CIPPCAPolicy - otherwise the compare diffs raw %tokens% against the deployed
+    # policy's resolved values and flags every templated field as permanent drift.
+    if ($JSONObj) { $JSONObj = Get-CIPPTextReplacement -TenantFilter $Tenant -Text $JSONObj -EscapeForJson }
+
     try {
         #Get from DB, as we just downloaded the latest before the standard runs.
         $AllCAPolicies = New-CIPPDbRequest -TenantFilter $tenant -Type 'ConditionalAccessPolicies'
@@ -68,11 +79,9 @@ function Invoke-CIPPStandardConditionalAccessTemplate {
     }
 
     $DeployError = $null
-    if ($Settings.remediate -eq $true) {
+    if ($Settings.remediate -eq $true -and $JSONObj) {
         try {
-            $Filter = "PartitionKey eq 'CATemplate' and RowKey eq '$($Settings.TemplateList.value)'"
-            $JSONObj = (Get-CippAzDataTableEntity @Table -Filter $Filter).JSON
-            $Policy = $JSONObj | ConvertFrom-Json
+            $Policy = $JSONObj | ConvertFrom-Json -Depth 100
             if ($Policy.conditions.userRiskLevels.count -gt 0 -or $Policy.conditions.signInRiskLevels.count -gt 0) {
                 $TestP2 = Test-CIPPStandardLicense -StandardName 'ConditionalAccessTemplate_p2' -TenantFilter $Tenant -Preset EntraP2 -SkipLog
                 if (!$TestP2) {
@@ -107,12 +116,16 @@ function Invoke-CIPPStandardConditionalAccessTemplate {
     }
     if ($Settings.report -eq $true -or $Settings.remediate -eq $true) {
         $FieldName = "standards.ConditionalAccessTemplate.$($Settings.TemplateList.value)"
-        $Filter = "PartitionKey eq 'CATemplate' and RowKey eq '$($Settings.TemplateList.value)'"
-        $Policy = (Get-CippAzDataTableEntity @Table -Filter $Filter).JSON | ConvertFrom-Json -Depth 10
+        # Guarded: piping a null blob into ConvertFrom-Json writes a binding error to the stream
+        # before landing on the same null, which buries the actionable message logged below.
+        $Policy = if ($JSONObj) { $JSONObj | ConvertFrom-Json -Depth 100 } else { $null }
 
         if ($null -eq $Policy) {
-            Write-LogMessage -API 'Standards' -tenant $Tenant -message "Conditional Access template '$($Settings.TemplateList.label)' ($($Settings.TemplateList.value)) could not be loaded from the template store - skipping." -Sev 'Error'
-            Set-CIPPStandardsCompareField -FieldName $FieldName -CurrentValue @{ Differences = "Template '$($Settings.TemplateList.label)' could not be loaded from the template store." } -ExpectedValue @{ Differences = @() } -Tenant $Tenant
+            # Same wording as Invoke-CIPPCATemplateBatch, so the report row says which template is
+            # gone and what to do about it instead of a bare "could not be loaded".
+            $MissingText = "Template '$($Settings.TemplateList.label)' ($($Settings.TemplateList.value)) no longer exists in the template library. Remove it from the standards template or select the template again."
+            Write-LogMessage -API 'Standards' -tenant $Tenant -message "Conditional Access template '$($Settings.TemplateList.label)' ($($Settings.TemplateList.value)) could not be loaded from the template store - skipping. $MissingText" -Sev 'Error'
+            Set-CIPPStandardsCompareField -FieldName $FieldName -CurrentValue @{ Differences = $MissingText } -ExpectedValue @{ Differences = @() } -Tenant $Tenant
             return
         }
 
@@ -171,9 +184,9 @@ function Invoke-CIPPStandardConditionalAccessTemplate {
                 return
             }
 
-            if ($Settings.state -and $Settings.state -ne 'donotchange' -and $CompareObj.state -eq $Settings.state) {
-                Write-Information "Policy is in the deployed state '$($CompareObj.state)'; not comparing against template state '$($Policy.state)'"
-                $Policy | Add-Member -NotePropertyName 'state' -NotePropertyValue $CompareObj.state -Force
+            # Override the template's state with the standard's state for drift comparison
+            if ($Settings.state -and $Settings.state -ne 'donotchange') {
+                $Policy | Add-Member -NotePropertyName 'state' -NotePropertyValue $Settings.state -Force
             }
 
             try {

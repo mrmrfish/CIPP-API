@@ -47,8 +47,9 @@ BeforeAll {
         }
     }
 
-    # A record the fold cannot bucket: Hashtable.ContainsKey rejects a null key, so this
-    # trips the per-record catch instead of producing a row.
+    # A TVM software-inventory row with no CVE. The fold skips these up front (counting them
+    # as skipped) rather than trying to bucket a null key, which previously threw and was
+    # logged per-record as an 'Allover Build' error.
     function New-UnbucketableRecord {
         param($deviceId = 'd-bad')
         [pscustomobject]@{ cveId = $null; deviceId = $deviceId }
@@ -117,9 +118,10 @@ Describe 'get-DefenderCVEs' {
 
             $Result = @(get-DefenderCVEs -TenantFilter $script:Tenant)
 
-            # Piping the List into ConvertTo-Json (rather than -InputObject) is what produces
-            # the bare object for one device. Invoke-ListCVEManagement ConvertFrom-Json's this
-            # and foreach's the result, so both shapes have to keep working.
+            # The emit stage decides the shape off DeviceCount: one device stays a bare
+            # object, several get wrapped as an array - exactly what piping a List through
+            # ConvertTo-Json used to produce. Invoke-ListCVEManagement ConvertFrom-Json's
+            # this and foreach's the result, so both shapes have to keep working.
             ($Result | Where-Object { $_.cveId -eq 'CVE-SINGLE' }).deviceDetailsJson | Should -Match '^\{'
             ($Result | Where-Object { $_.cveId -eq 'CVE-MULTI' }).deviceDetailsJson | Should -Match '^\['
         }
@@ -210,21 +212,52 @@ Describe 'get-DefenderCVEs' {
             }
         }
 
-        It 'folds each record as it arrives rather than after the whole fetch completes' {
+        It 'serialises each device once as it arrives, not once per row at emit' {
+            # Device metadata is folded into its CVE bucket as JSON text on arrival, so the
+            # aggregator holds strings rather than a hashtable per (device x software x CVE)
+            # record - the single largest thing this function would otherwise retain, and it
+            # runs on the HTTP worker pool per user request. One ConvertTo-Json call per
+            # incoming record; anything higher means a second serialisation crept back into
+            # the emit stage, which is what put two copies of a CVE's devices in memory.
             Mock -CommandName Get-DefenderTvmRaw -MockWith {
-                New-TvmRecord -cveId 'CVE-A' -deviceId 'd1'
-                New-UnbucketableRecord
-                throw 'page 3 failed'
+                foreach ($i in 1..30) { New-TvmRecord -cveId "CVE-$i" -deviceId "d$i" }
             }
 
-            { get-DefenderCVEs -TenantFilter $script:Tenant } | Should -Throw
+            $script:JsonCalls = 0
+            Mock -CommandName ConvertTo-Json -MockWith { $script:JsonCalls++; '{}' }
 
-            # The unbucketable record is only ever logged from inside the fold. A buffered
-            # fetch would throw before a single record reached the fold, so this log is the
-            # observable proof that stage 1 streams.
-            Should -Invoke Write-LogMessage -Times 1 -Exactly -ParameterFilter {
-                $message -like 'Allover Build*'
+            $null = @(get-DefenderCVEs -TenantFilter $script:Tenant)
+
+            $script:JsonCalls | Should -Be 30
+        }
+
+        It 'emits each row to the pipeline individually rather than as one materialised list' {
+            Mock -CommandName Get-DefenderTvmRaw -MockWith {
+                foreach ($i in 1..25) { New-TvmRecord -cveId "CVE-$i" -deviceId "d$i" }
             }
+
+            $Received = [System.Collections.Generic.List[object]]::new()
+            get-DefenderCVEs -TenantFilter $script:Tenant | ForEach-Object { $Received.Add($_) }
+
+            # ForEach-Object runs once per pipeline object, so 25 additions of single rows
+            # means the caller can fold and release them one at a time. A function that
+            # returned a List in one piece would arrive here as 25 items too - PowerShell
+            # unrolls it - but a wrapped (,$list) return would land as one 25-element item.
+            $Received.Count | Should -Be 25
+            $Received | ForEach-Object { @($_).Count | Should -Be 1 }
+        }
+
+        It 'skips records with no CVE without throwing or logging an error' {
+            Mock -CommandName Get-DefenderTvmRaw -MockWith {
+                New-UnbucketableRecord -deviceId 'd0'
+                New-TvmRecord -cveId 'CVE-2024-0009' -deviceId 'd1'
+            }
+
+            $Result = @(get-DefenderCVEs -TenantFilter $script:Tenant)
+
+            $Result.cveId | Should -Be 'CVE-2024-0009'
+            Should -Invoke Write-LogMessage -Times 0 -Exactly -ParameterFilter { $message -like 'Allover Build*' }
+            Should -Invoke Write-LogMessage -Times 0 -Exactly -ParameterFilter { $sev -eq 'Error' }
         }
     }
 

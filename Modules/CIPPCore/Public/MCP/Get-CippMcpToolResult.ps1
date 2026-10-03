@@ -3,7 +3,8 @@ function Get-CippMcpToolResult {
     .SYNOPSIS
         Dispatches a single MCP 'tools/call' through the five-tool gateway.
     .DESCRIPTION
-        SearchTools and GetToolInfo are answered locally from the read-only tool catalog.
+        SearchTools and GetToolInfo are answered locally from the read-only tool catalog, and
+        SearchDocs / GetDoc from the documentation index shipped in the image.
         ListTenants, ListGraphRequest and ExecTool targets are re-dispatched through
         New-CippCoreRequest via Invoke-CippMcpApiRequest, so RBAC and tenant scoping are enforced
         on every execution. Direct calls to bare catalog tool names are still accepted for
@@ -77,6 +78,29 @@ function Get-CippMcpToolResult {
                 isError = $false
             }
         }
+        'SearchDocs' {
+            # Answered locally, like SearchTools: the documentation is shipped in the image and
+            # is not tenant data, so there is nothing to re-dispatch through the API and no
+            # tenant scoping to enforce.
+            $Limit = $ArgHash['limit'] -as [int]
+            if (-not $Limit) { $Limit = 8 }
+            $DocResult = Find-CippDoc -Query ([string]$ArgHash['query']) -Path ([string]$ArgHash['path']) -Limit $Limit
+            return [ordered]@{
+                content = @(@{ type = 'text'; text = ($DocResult | ConvertTo-Json -Depth 10 -Compress) })
+                isError = [bool]$DocResult.error
+            }
+        }
+        'GetDoc' {
+            $DocPath = [string]($ArgHash['path'] ?? $ArgHash['name'])
+            if ([string]::IsNullOrWhiteSpace($DocPath)) {
+                throw [pscustomobject]@{ code = -32602; message = 'Invalid params: path (from a SearchDocs result) is required' }
+            }
+            $Doc = Get-CippDoc -Path $DocPath
+            return [ordered]@{
+                content = @(@{ type = 'text'; text = ($Doc | ConvertTo-Json -Depth 10 -Compress) })
+                isError = [bool]$Doc.error
+            }
+        }
         'ExecTool' {
             $TargetName = [string]$ArgHash['name']
             if ([string]::IsNullOrWhiteSpace($TargetName)) {
@@ -97,7 +121,7 @@ function Get-CippMcpToolResult {
                     isError = $true
                 }
             }
-            return Invoke-CippMcpApiRequest -Request $Request -TriggerMetadata $TriggerMetadata -ToolName $TargetName -Arguments $ArgHash['arguments'] -Method $Entry._method -ParamAlias $Entry._paramAlias
+            return Invoke-CippMcpApiRequest -Request $Request -TriggerMetadata $TriggerMetadata -ToolName $TargetName -Arguments $ArgHash['arguments'] -Method $Entry._method -ParamAlias $Entry._paramAlias -InputSchema $Entry.inputSchema
         }
         default {
             # Core passthroughs (always available) and legacy direct catalog calls (respect connector scoping).
@@ -111,7 +135,7 @@ function Get-CippMcpToolResult {
             if (-not $Entry) {
                 throw [pscustomobject]@{ code = -32602; message = "Unknown or unavailable tool: $ToolName. Use SearchTools to discover valid tool names." }
             }
-            return Invoke-CippMcpApiRequest -Request $Request -TriggerMetadata $TriggerMetadata -ToolName $ToolName -Arguments $Arguments -Method $Entry._method -ParamAlias $Entry._paramAlias
+            return Invoke-CippMcpApiRequest -Request $Request -TriggerMetadata $TriggerMetadata -ToolName $ToolName -Arguments $Arguments -Method $Entry._method -ParamAlias $Entry._paramAlias -InputSchema $Entry.inputSchema
         }
     }
 }

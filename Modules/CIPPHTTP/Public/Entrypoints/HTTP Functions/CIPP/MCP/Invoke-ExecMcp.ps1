@@ -60,6 +60,7 @@ function Invoke-ExecMcp {
         return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::Accepted; Body = '' })
     }
 
+    $EgressTag = [string]$Rpc.method
     try {
         if (-not $Rpc.method) {
             throw [pscustomobject]@{ code = -32600; message = 'Invalid Request: missing method' }
@@ -82,12 +83,16 @@ function Invoke-ExecMcp {
                         name    = 'CIPP'
                         version = $Request.Headers.'X-CIPP-Version' ?? 'unknown'
                     }
-                    instructions    = 'CIPP is a gateway to the read-only CIPP API. Five tools are exposed: ListTenants (enumerate managed tenants; most tools need a tenantFilter — use the tenant''s defaultDomainName), ListGraphRequest (proxy an arbitrary Microsoft Graph GET), SearchTools (browse or keyword-search the full tool catalog), GetToolInfo (fetch a tool''s input schema), and ExecTool (run any discovered tool by name). Typical flow: ListTenants -> SearchTools -> GetToolInfo -> ExecTool.'
+                    instructions    = 'CIPP is a gateway to the read-only CIPP API. Seven tools are exposed: ListTenants (enumerate managed tenants; most tools need a tenantFilter — use the tenant''s defaultDomainName), ListGraphRequest (proxy an arbitrary Microsoft Graph GET), SearchTools (browse or keyword-search the full tool catalog), GetToolInfo (fetch a tool''s input schema), ExecTool (run any discovered tool by name), SearchDocs (search the CIPP documentation) and GetDoc (fetch one documentation page in full). Typical flow for data: ListTenants -> SearchTools -> GetToolInfo -> ExecTool. For questions about how CIPP works or how to configure it, start with SearchDocs rather than guessing.'
                 }
             }
             'ping' { $Result = @{} }
             'tools/list' { $Result = [ordered]@{ tools = @(Get-CippMcpToolList -Request $Request) } }
             'tools/call' {
+                # Craft accounts MCP egress per tool (and per Graph resource) off X-Craft-Endpoint.
+                $ToolCall = if ($Rpc.params.name -eq 'ExecTool') { $Rpc.params.arguments } else { $Rpc.params }
+                $EgressTag = [string]$ToolCall.name
+                if ($EgressTag -eq 'ListGraphRequest') { $EgressTag = ('ListGraphRequest:{0}' -f (Get-CippGraphEndpointLabel -Endpoint $ToolCall.arguments.Endpoint)).TrimEnd(':') }
                 $Result = Get-CippMcpToolResult -Request $Request -TriggerMetadata $TriggerMetadata -ToolName $Rpc.params.name -Arguments $Rpc.params.arguments
             }
             default { throw [pscustomobject]@{ code = -32601; message = "Method not found: $($Rpc.method)" } }
@@ -102,7 +107,7 @@ function Invoke-ExecMcp {
 
     return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
-            Headers    = @{ 'Content-Type' = 'application/json' }
+            Headers    = @{ 'Content-Type' = 'application/json'; 'X-Craft-Endpoint' = $EgressTag }
             Body       = ($ResponseBody | ConvertTo-Json -Depth 30 -Compress)
         })
 }

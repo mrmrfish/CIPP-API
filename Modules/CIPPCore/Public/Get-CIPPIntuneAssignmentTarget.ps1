@@ -18,6 +18,12 @@ function Get-CIPPIntuneAssignmentTarget {
         "Add all users" writes. A MAM policy protects a user's apps and has no device audience at
         all, so All Devices has no equivalent and is reported as unsupported rather than guessed at.
 
+        Device Preparation profiles (Autopilot device preparation) have the same shape for a
+        different reason: the deployment starts when an assigned user signs in during OOBE, so the
+        assignment surface is user groups only - the portal picker offers the same well-known All
+        Users virtual group and no All Devices equivalent. The broad virtual targets are not what
+        the portal writes for them and leave the profile without an effective assignment.
+
         'customGroup' and 'On' produce no broad target: the caller resolves group names itself.
 
     .PARAMETER AssignTo
@@ -37,6 +43,9 @@ function Get-CIPPIntuneAssignmentTarget {
                           the request still can
             GroupNames  - display names for any virtual group a broad target resolved to, keyed by
                           id, so the comparison can name it instead of printing a bare GUID
+            Equivalents - assignment types that express the same audience as a broad group target,
+                          keyed by that target's group id. Remediation keeps writing the group
+                          target; the comparison accepts either shape.
 
     .EXAMPLE
         Get-CIPPIntuneAssignmentTarget -AssignTo 'allLicensedUsers' -PolicyType 'iosManagedAppProtections'
@@ -50,7 +59,8 @@ function Get-CIPPIntuneAssignmentTarget {
         [string]$PolicyType
     )
 
-    # Intune's well-known virtual group for "all users", the only way to express it on a MAM policy.
+    # Intune's well-known virtual group for "all users", the only way to express it on a policy
+    # type whose assignment surface is groups only (MAM, Device Preparation).
     $MamAllUsersGroupId = 'acacacac-9df4-4c7d-9d50-4ef0226f57a9'
 
     $MamPolicyTypes = @(
@@ -63,7 +73,17 @@ function Get-CIPPIntuneAssignmentTarget {
     )
     $IsMam = $MamPolicyTypes -contains $PolicyType
 
-    $AllUsersTarget = if ($IsMam) {
+    # Policy types whose assignment surface is user groups only. Device Preparation deployments
+    # trigger on the enrolling user, so a device audience cannot be expressed for them at all.
+    # Apple enrollment type profiles apply to the enrolling user the same way - the portal's
+    # picker offers user groups and nothing else.
+    $UserGroupOnlyTypes = @(
+        'DevicePrepProfile'
+        'AppleEnrollmentTypeProfile'
+    )
+    $IsUserGroupOnly = $IsMam -or ($UserGroupOnlyTypes -contains $PolicyType)
+
+    $AllUsersTarget = if ($IsUserGroupOnly) {
         @{ '@odata.type' = '#microsoft.graph.groupAssignmentTarget'; groupId = $MamAllUsersGroupId }
     } else {
         @{ '@odata.type' = '#microsoft.graph.allLicensedUsersAssignmentTarget' }
@@ -81,12 +101,14 @@ function Get-CIPPIntuneAssignmentTarget {
         'AllDevices' {
             if ($IsMam) {
                 $Unsupported = "'$PolicyType' policies protect a user's apps and have no device audience, so they cannot be assigned to All Devices. Assign to all users or to a group instead."
+            } elseif ($IsUserGroupOnly) {
+                $Unsupported = "'$PolicyType' deployments start when an assigned user signs in, so they cannot be assigned to All Devices. Assign to all users instead."
             } else {
                 $Targets.Add($AllDevicesTarget)
             }
         }
         'AllDevicesAndUsers' {
-            if ($IsMam) {
+            if ($IsUserGroupOnly) {
                 # The users half is still expressible, so honour it rather than failing the whole
                 # assignment over a target this policy type has no concept of.
                 $Dropped.Add('All Devices')
@@ -103,11 +125,20 @@ function Get-CIPPIntuneAssignmentTarget {
         $GroupNames[$MamAllUsersGroupId] = 'All Users'
     }
 
+    # Outside MAM, the device management service reports an All Users group assignment back as
+    # allLicensedUsersAssignmentTarget, so both shapes describe the same working assignment and the
+    # comparison must accept either. The MAM service rejects that type outright, so it stays out.
+    $Equivalents = @{}
+    if (-not $IsMam -and $Targets.groupId -contains $MamAllUsersGroupId) {
+        $Equivalents[$MamAllUsersGroupId] = @('#microsoft.graph.allLicensedUsersAssignmentTarget')
+    }
+
     [PSCustomObject]@{
         Targets     = @($Targets)
         Unsupported = $Unsupported
         Dropped     = @($Dropped)
         GroupNames  = $GroupNames
+        Equivalents = $Equivalents
         IsMam       = $IsMam
     }
 }

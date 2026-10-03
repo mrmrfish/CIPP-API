@@ -38,41 +38,83 @@ function Set-CIPPDBCacheDefenderCVEs {
         $RecordCount = 0
         $SkippedCount = 0
 
+        # Tenant-wide device tables. TVM repeats every device once per (software x CVE), so a
+        # per-CVE copy of each device's id and JSON text costs ~350-400 bytes per CVE x device
+        # pair - hundreds of MB on a large tenant, all retained until the stream ends. Instead
+        # each distinct device is stored once and a CVE bucket holds small integer indexes:
+        #   $DeviceKeyIndex  dedupe key (id, else name; case-insensitive) -> key index
+        #   $FragmentIndex   exact id + name text -> fragment index
+        #   $DeviceFragments fragment index -> the {deviceId, deviceName} JSON text
+        # Two indexes rather than one because dedupe is case-insensitive but the stored text is
+        # whatever the CVE's first record for that device said, exactly as before. Read by index (a
+        # missing key is $null), not TryGetValue: a [ref] out-parameter costs several times an index
+        # lookup per record.
+        $DeviceKeyIndex = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $FragmentIndex = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)
+        $DeviceFragments = [System.Collections.Generic.List[string]]::new()
+
         Get-DefenderTvmRaw -TenantId $TenantFilter -Stream | ForEach-Object {
             $Vuln = $_
             $RecordCount++
 
             try {
                 $CveId = $Vuln.cveId
+                # TVM also returns software-inventory rows with no CVE. Skip them before the
+                # hashtable lookup: ContainsKey($null) throws, which was caught per-record and
+                # logged as an 'Allover Build' error for every such row.
+                if ([string]::IsNullOrWhiteSpace($CveId)) { $SkippedCount++; return }
 
                 if (-not $CveAggregator.ContainsKey($CveId)) {
                     # Establish global CVE & software properties for this specific tenant
                     $CveAggregator[$CveId] = @{
-                        cveId                        = $CveId
-                        customerId                   = $TenantFilter
-                        softwareVendor               = $Vuln.softwareVendor               ?? ''
-                        softwareName                 = $Vuln.softwareName                 ?? ''
-                        vulnerabilitySeverityLevel   = $Vuln.vulnerabilitySeverityLevel   ?? ''
-                        recommendedSecurityUpdate    = $Vuln.recommendedSecurityUpdate    ?? ''
-                        recommendedSecurityUpdateUrl = $Vuln.recommendedSecurityUpdateUrl ?? ''
-                        exploitabilityLevel          = $Vuln.exploitabilityLevel          ?? ''
+                        cveId                      = $CveId
+                        customerId                 = $TenantFilter
+                        softwareVendor             = $Vuln.softwareVendor             ?? ''
+                        softwareName               = $Vuln.softwareName               ?? ''
+                        softwareVersion            = $Vuln.softwareVersion            ?? ''
+                        vulnerabilitySeverityLevel = $Vuln.vulnerabilitySeverityLevel ?? ''
+                        exploitabilityLevel        = $Vuln.exploitabilityLevel        ?? ''
 
-                        # Arrays to collect device metadata efficiently
-                        AffectedDevices              = [System.Collections.Generic.List[object]]::new()
+                        # Dedupe key indexes seen on this CVE, so DeviceCount is a unique-device
+                        # count and each affected device is stored once however many software
+                        # packages reported the CVE on it.
+                        SeenDevices                = [System.Collections.Generic.HashSet[int]]::new()
+                        # Fragment indexes in first-seen order - the order the row lists them in.
+                        Devices                    = [System.Collections.Generic.List[int]]::new()
                     }
                 }
 
-                # Extract properties specific to this device instance and append in one
-                # step, so a record that fails mid-extraction cannot leave a previous
-                # record's payload behind to be appended to the wrong CVE.
-                [void]$CveAggregator[$CveId].AffectedDevices.Add(@{
-                        deviceId        = ($Vuln.deviceId -join ',') ?? ''
-                        deviceName      = ($Vuln.deviceName -join ',') ?? ''
-                        osVersion       = $Vuln.osVersion ?? ''
-                        softwareVersion = ($Vuln.softwareVersion -join ',') ?? ''
-                        diskPaths       = if ($Vuln.diskPaths) { $Vuln.diskPaths -join ';' } else { '' }
-                        registryPaths   = if ($Vuln.registryPaths) { $Vuln.registryPaths -join ';' } else { '' }
-                    })
+                # Minimal per-device payload: only the id and name are consumed downstream.
+                $DeviceId = ($Vuln.deviceId -join ',') ?? ''
+                $DeviceName = ($Vuln.deviceName -join ',') ?? ''
+
+                # Dedupe on the device id (falling back to the name).
+                $DeviceKey = if ($DeviceId) { $DeviceId } else { $DeviceName }
+                if (-not $DeviceKey) { return }
+
+                $KeyIndex = $DeviceKeyIndex[$DeviceKey]
+                if ($null -eq $KeyIndex) {
+                    $KeyIndex = $DeviceKeyIndex.Count
+                    $DeviceKeyIndex[$DeviceKey] = $KeyIndex
+                }
+
+                $Bucket = $CveAggregator[$CveId]
+                if ($Bucket.SeenDevices.Add($KeyIndex)) {
+                    $FragmentKey = "$DeviceId`0$DeviceName"
+                    $Fragment = $FragmentIndex[$FragmentKey]
+                    if ($null -eq $Fragment) {
+                        # ConvertTo-Json builds the fragment rather than string interpolation, so
+                        # escaping of device names stays correct. Built once per device, not per
+                        # CVE x device pair.
+                        $DeviceFragments.Add((@{
+                                    deviceId   = $DeviceId
+                                    deviceName = $DeviceName
+                                } | ConvertTo-Json -Compress))
+                        $Fragment = $DeviceFragments.Count - 1
+                        $FragmentIndex[$FragmentKey] = $Fragment
+                    }
+                    $Bucket.Devices.Add($Fragment)
+                }
             } catch {
                 $SkippedCount++
                 $ErrorMessage = Get-CippException -Exception $_
@@ -103,7 +145,7 @@ function Set-CIPPDBCacheDefenderCVEs {
         # this as a per-run cacheTimeStamp.
         $LastUpdated = [string]$(Get-Date (Get-Date).ToUniversalTime() -UFormat '+%Y-%m-%dT%H:%M:%S.000Z')
 
-        # Snapshot the keys so buckets can be dropped while iterating — enumerating
+        # Snapshot the keys so buckets can be dropped while iterating - enumerating
         # $CveAggregator.Keys directly and removing from it throws InvalidOperationException.
         $CveKeys = [string[]]$CveAggregator.Keys
 
@@ -111,42 +153,50 @@ function Set-CIPPDBCacheDefenderCVEs {
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Cached $UniqueCves CVEs" -sev 'Info'
 
             # A single Add-CIPPDbItem invocation, fed lazily. This is deliberate: the
-            # function's end block runs one orphan cleanup against the RunStartUtc captured
-            # in its begin block, and writes DefenderCVEs-Count once. Splitting the flush
-            # into several calls would make each later call's cleanup delete rows written by
-            # earlier ones as soon as the run exceeded the 5 minute skew margin, and would
-            # leave the stored count equal to the final chunk instead of the total.
+            # function's end block runs one orphan cleanup keyed to the run id minted in
+            # its begin block, and writes DefenderCVEs-Count once. Splitting the flush
+            # into several calls would give each chunk its own run id, so each later call's
+            # cleanup would treat earlier chunks' rows as orphans as soon as the run
+            # exceeded the 5 minute skew margin, and would leave the stored count equal to
+            # the final chunk instead of the total.
             & {
                 foreach ($CveKey in $CveKeys) {
                     $CveData = $CveAggregator[$CveKey]
 
-                    # Flatten or convert device info arrays into a compact, compressed JSON string.
-                    # Piped (not -InputObject) so a single-device CVE serialises to an object and a
-                    # multi-device CVE to an array, exactly as before.
-                    $CompactDeviceJson = $CveData.AffectedDevices | ConvertTo-Json -Compress
+                    # The fragments are already JSON; only the surrounding shape is decided here.
+                    # A single-device CVE stays a bare object and a multi-device CVE becomes an
+                    # array, which is what piping a List through ConvertTo-Json used to produce and
+                    # what Get-CIPPCVEReport and the CVE management endpoint parse.
+                    $DeviceCount = $CveData.Devices.Count
+                    $Parts = [string[]]::new($DeviceCount)
+                    for ($i = 0; $i -lt $DeviceCount; $i++) { $Parts[$i] = $DeviceFragments[$CveData.Devices[$i]] }
+                    $CompactDeviceJson = if ($DeviceCount -eq 1) { $Parts[0] } else { '[' + [string]::Join(',', $Parts) + ']' }
 
                     @{
-                        PartitionKey                 = $CveKey
-                        RowKey                       = $TenantFilter # RowKey becomes just the Tenant, ensuring 1 row per CVE per Tenant
-                        customerId                   = $TenantFilter
-                        cveId                        = $CveKey
-                        softwareVendor               = $CveData.softwareVendor
-                        softwareName                 = $CveData.softwareName
-                        vulnerabilitySeverityLevel   = $CveData.vulnerabilitySeverityLevel
-                        recommendedSecurityUpdate    = $CveData.recommendedSecurityUpdate
-                        recommendedSecurityUpdateUrl = $CveData.recommendedSecurityUpdateUrl
-                        exploitabilityLevel          = $CveData.exploitabilityLevel
+                        PartitionKey               = $CveKey
+                        RowKey                     = $TenantFilter # blob field only; the table RowKey is derived from 'id' below
+                        # Stable table RowKey: Add-CIPPDbItem derives "$Type-$id", so this makes
+                        # writes idempotent (DefenderCVEs-<cveId>) instead of a random GUID per
+                        # run - which also stopped every run rewriting the whole tenant's rows.
+                        id                         = $CveKey
+                        customerId                 = $TenantFilter
+                        cveId                      = $CveKey
+                        softwareVendor             = $CveData.softwareVendor
+                        softwareName               = $CveData.softwareName
+                        softwareVersion            = $CveData.softwareVersion
+                        vulnerabilitySeverityLevel = $CveData.vulnerabilitySeverityLevel
+                        exploitabilityLevel        = $CveData.exploitabilityLevel
 
-                        # Meta aggregation counts
-                        deviceCount                  = $CveData.AffectedDevices.Count
+                        # Unique affected-device count for this CVE in this tenant.
+                        deviceCount                = $DeviceCount
 
-                        # All individual device variations compressed safely inside a single field
-                        deviceDetailsJson            = $CompactDeviceJson
+                        # Minimal per-device detail ({deviceId, deviceName}) as one JSON string.
+                        deviceDetailsJson          = $CompactDeviceJson
 
-                        lastUpdated                  = $LastUpdated
+                        lastUpdated                = $LastUpdated
                     }
 
-                    # The row is built; drop the bucket so its device list is collectable
+                    # The row is built; drop the bucket so its index lists are collectable
                     # before the next CVE is serialised.
                     $CveAggregator.Remove($CveKey)
                 }
@@ -158,6 +208,10 @@ function Set-CIPPDBCacheDefenderCVEs {
 
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
+        if (Test-CIPPCacheCapabilityError -Message $_.Exception.Message) {
+            Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Skipping Defender CVE cache - tenant not onboarded to Defender for Endpoint: $($ErrorMessage.NormalizedError)" -sev 'Debug' -LogData $ErrorMessage
+            return
+        }
         Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "CVE Cache Refresh failed: $($ErrorMessage.NormalizedError)" -sev 'Error' -LogData $ErrorMessage
         throw
     }
